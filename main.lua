@@ -16,11 +16,6 @@ local DEFAULT_FZF_ARGS = {
 	"--no-preview",
 }
 
-local RESERVED_ACTIONS = {
-	a = true,
-	s = true,
-}
-
 local get_config = ya.sync(function(state)
 	return state.config
 end)
@@ -64,8 +59,13 @@ local function append_unique(items, value)
 	items[#items + 1] = value
 end
 
-local function parse_custom_openers(value)
+local function parse_custom_openers(value, target_os)
 	local result, actions = {}, {}
+	local reserved_actions = { s = true }
+	if target_os == "macos" then
+		reserved_actions.a = true
+	end
+
 	if value == nil then
 		return result
 	elseif type(value) ~= "table" then
@@ -85,7 +85,7 @@ local function parse_custom_openers(value)
 				notify(prefix .. ".name must be a non-empty string; ignoring it.", "warn")
 			elseif type(path) ~= "string" or path == "" then
 				notify(prefix .. ".path must be a non-empty string; ignoring it.", "warn")
-			elseif RESERVED_ACTIONS[on] then
+			elseif reserved_actions[on] then
 				notify(prefix .. ".on conflicts with a built-in action; ignoring it.", "warn")
 			elseif actions[on] then
 				notify(prefix .. ".on duplicates another custom action; ignoring it.", "warn")
@@ -103,17 +103,19 @@ local function parse_custom_openers(value)
 	return result
 end
 
-local function make_config(options)
+local function make_config(options, target_os)
 	options = options or {}
 
-	local roots
-	if options.application_roots == nil then
-		roots = copy_strings(DEFAULT_ROOTS)
-	else
-		roots = copy_strings(options.application_roots)
-	end
-	if options.include_system_applications ~= false then
-		append_unique(roots, "/System/Applications")
+	local roots = {}
+	if target_os == "macos" then
+		if options.application_roots == nil then
+			roots = copy_strings(DEFAULT_ROOTS)
+		else
+			roots = copy_strings(options.application_roots)
+		end
+		if options.include_system_applications ~= false then
+			append_unique(roots, "/System/Applications")
+		end
 	end
 
 	local shell_path = options.shell_path
@@ -121,14 +123,15 @@ local function make_config(options)
 		shell_path = os.getenv("SHELL")
 	end
 	if not shell_path or shell_path == "" then
-		shell_path = "/bin/zsh"
+		shell_path = target_os == "linux" and "/bin/sh" or "/bin/zsh"
 	end
 
 	return {
 		application_roots = roots,
-		custom_openers = parse_custom_openers(options.custom_openers),
+		custom_openers = parse_custom_openers(options.custom_openers, target_os),
 		fzf_args = copy_strings(options.fzf_args),
 		shell_path = shell_path,
+		target_os = target_os,
 	}
 end
 
@@ -186,13 +189,26 @@ local function start_finder(source)
 	if source.kind == "application" then
 		command:arg({ "-name", "*.app", "-prune", "-print0" })
 	else
-		command:arg({
-			"(", "-type", "d", "-name", "*.app", "-prune", "-print0", ")",
-			"-o",
+		local args = {
 			"(", "-type", "d", "-name", ".*", "!", "-path", source.roots[1], "-prune", ")",
 			"-o",
-			"(", "-type", "f", "-perm", "+0111", "-print0", ")",
-		})
+		}
+		if source.include_applications then
+			for _, arg in ipairs({
+				"(", "-type", "d", "-name", "*.app", "-prune", "-print0", ")",
+				"-o",
+			}) do
+				args[#args + 1] = arg
+			end
+		end
+		for _, arg in ipairs({
+			"(", "-type", "f",
+			"(", "-perm", "-0100", "-o", "-perm", "-0010", "-o", "-perm", "-0001", ")",
+			"-print0", ")",
+		}) do
+			args[#args + 1] = arg
+		end
+		command:arg(args)
 	end
 
 	return command
@@ -284,6 +300,7 @@ local function pick_custom_opener(config, opener)
 
 	return pick_from_source(config, {
 		kind = "custom",
+		include_applications = config.target_os == "macos",
 		name = opener.name,
 		roots = { root },
 	})
@@ -331,8 +348,8 @@ local function run_executable(executable, targets)
 	end
 end
 
-local function open_with_custom_opener(opener, targets)
-	if opener:sub(-4) == ".app" then
+local function open_with_custom_opener(config, opener, targets)
+	if config.target_os == "macos" and opener:sub(-4) == ".app" then
 		open_with_application(opener, targets)
 	else
 		run_executable(opener, targets)
@@ -375,10 +392,11 @@ local function handle(targets)
 	end
 
 	local config = get_config()
-	local actions = {
-		{ on = "a", desc = "Application", kind = "application" },
-		{ on = "s", desc = "Shell", kind = "shell" },
-	}
+	local actions = {}
+	if config.target_os == "macos" then
+		actions[#actions + 1] = { on = "a", desc = "Application", kind = "application" }
+	end
+	actions[#actions + 1] = { on = "s", desc = "Shell", kind = "shell" }
 	for _, opener in ipairs(config.custom_openers) do
 		actions[#actions + 1] = {
 			on = opener.on,
@@ -407,18 +425,19 @@ local function handle(targets)
 	elseif action.kind == "custom" then
 		local opener = pick_custom_opener(config, action.opener)
 		if opener then
-			open_with_custom_opener(opener, targets)
+			open_with_custom_opener(config, opener, targets)
 		end
 	end
 end
 
 function M:setup(options)
-	if ya.target_os() ~= "macos" then
-		notify("freeopen.yazi currently supports macOS only.", "warn")
+	local target_os = ya.target_os()
+	if target_os ~= "macos" and target_os ~= "linux" then
+		notify("freeopen.yazi currently supports macOS and Linux only.", "warn")
 		return
 	end
 
-	local first = initialize(make_config(options))
+	local first = initialize(make_config(options, target_os))
 	register_opener()
 
 	if first then
