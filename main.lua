@@ -14,7 +14,11 @@ local DEFAULT_FZF_ARGS = {
 	"--height=80%",
 	"--border",
 	"--no-preview",
-	"--prompt=Application> ",
+}
+
+local RESERVED_ACTIONS = {
+	a = true,
+	s = true,
 }
 
 local get_config = ya.sync(function(state)
@@ -60,6 +64,45 @@ local function append_unique(items, value)
 	items[#items + 1] = value
 end
 
+local function parse_custom_openers(value)
+	local result, actions = {}, {}
+	if value == nil then
+		return result
+	elseif type(value) ~= "table" then
+		notify("custom_openers must be a list; ignoring it.", "warn")
+		return result
+	end
+
+	for index, item in ipairs(value) do
+		local prefix = "custom_openers[" .. tostring(index) .. "]"
+		if type(item) ~= "table" then
+			notify(prefix .. " must be a table; ignoring it.", "warn")
+		else
+			local on, name, path = item.on, item.name, item.path
+			if type(on) ~= "string" or on == "" then
+				notify(prefix .. ".on must be a non-empty string; ignoring it.", "warn")
+			elseif type(name) ~= "string" or name == "" then
+				notify(prefix .. ".name must be a non-empty string; ignoring it.", "warn")
+			elseif type(path) ~= "string" or path == "" then
+				notify(prefix .. ".path must be a non-empty string; ignoring it.", "warn")
+			elseif RESERVED_ACTIONS[on] then
+				notify(prefix .. ".on conflicts with a built-in action; ignoring it.", "warn")
+			elseif actions[on] then
+				notify(prefix .. ".on duplicates another custom action; ignoring it.", "warn")
+			else
+				actions[on] = true
+				result[#result + 1] = {
+					on = on,
+					name = name,
+					path = path,
+				}
+			end
+		end
+	end
+
+	return result
+end
+
 local function make_config(options)
 	options = options or {}
 
@@ -83,6 +126,7 @@ local function make_config(options)
 
 	return {
 		application_roots = roots,
+		custom_openers = parse_custom_openers(options.custom_openers),
 		fzf_args = copy_strings(options.fzf_args),
 		shell_path = shell_path,
 	}
@@ -122,7 +166,7 @@ local function expand_home(path)
 	return path
 end
 
-local function existing_roots(config)
+local function existing_application_roots(config)
 	local roots, seen = {}, {}
 	for _, root in ipairs(config.application_roots) do
 		root = expand_home(root)
@@ -137,20 +181,29 @@ local function existing_roots(config)
 	return roots
 end
 
-local function pick_application(config)
-	local roots = existing_roots(config)
-	if #roots == 0 then
-		notify("No application directories are available.")
-		return
+local function start_finder(source)
+	local command = Command("find"):arg(source.roots)
+	if source.kind == "application" then
+		command:arg({ "-name", "*.app", "-prune", "-print0" })
+	else
+		command:arg({
+			"(", "-type", "d", "-name", "*.app", "-prune", "-print0", ")",
+			"-o",
+			"(", "-type", "d", "-name", ".*", "!", "-path", source.roots[1], "-prune", ")",
+			"-o",
+			"(", "-type", "f", "-perm", "+0111", "-print0", ")",
+		})
 	end
 
-	local finder, find_err = Command("find")
-		:arg(roots)
-		:arg({ "-name", "*.app", "-prune", "-print0" })
+	return command
 		:stdout(Command.PIPED)
 		:spawn()
+end
+
+local function pick_from_source(config, source)
+	local finder, find_err = start_finder(source)
 	if not finder then
-		notify("Failed to scan applications: " .. tostring(find_err))
+		notify("Failed to scan " .. source.name .. ": " .. tostring(find_err))
 		return
 	end
 
@@ -158,11 +211,12 @@ local function pick_application(config)
 	if not finder_stdout then
 		finder:start_kill()
 		finder:wait()
-		notify("Failed to read the application list.")
+		notify("Failed to read the " .. source.name .. " list.")
 		return
 	end
 
 	local fzf_args = copy_strings(DEFAULT_FZF_ARGS)
+	fzf_args[#fzf_args + 1] = "--prompt=" .. source.name .. "> "
 	for _, arg in ipairs(config.fzf_args) do
 		fzf_args[#fzf_args + 1] = arg
 	end
@@ -199,11 +253,40 @@ local function pick_application(config)
 	elseif output.status.code == 130 then
 		return
 	elseif output.status.code == 1 and find_status and find_status.success then
-		notify("No applications were found.", "warn")
+		notify("No candidates were found in " .. source.name .. ".", "warn")
 		return
 	end
 
 	notify("fzf exited with code " .. tostring(output.status.code))
+end
+
+local function pick_application(config)
+	local roots = existing_application_roots(config)
+	if #roots == 0 then
+		notify("No application directories are available.")
+		return
+	end
+
+	return pick_from_source(config, {
+		kind = "application",
+		name = "Application",
+		roots = roots,
+	})
+end
+
+local function pick_custom_opener(config, opener)
+	local root = expand_home(opener.path)
+	local cha = fs.cha(Url(root))
+	if not cha or not cha.is_dir then
+		notify(opener.name .. " directory is unavailable: " .. root)
+		return
+	end
+
+	return pick_from_source(config, {
+		kind = "custom",
+		name = opener.name,
+		roots = { root },
+	})
 end
 
 local function open_with_application(application, targets)
@@ -223,6 +306,37 @@ end
 
 local function trim(value)
 	return value:gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function output_error(output, fallback)
+	local detail = trim(output.stderr)
+	if detail == "" then
+		detail = trim(output.stdout)
+	end
+	return detail ~= "" and fallback .. ":\n" .. detail or fallback
+end
+
+local function run_executable(executable, targets)
+	local output, err = Command(executable)
+		:arg(targets)
+		:cwd(tostring(fs.cwd()))
+		:output()
+	if not output then
+		notify("Failed to start " .. executable .. ": " .. tostring(err))
+	elseif not output.status.success then
+		local code = output.status.code
+		local message = code and "Executable exited with code " .. tostring(code)
+			or "Executable was terminated"
+		notify(output_error(output, message))
+	end
+end
+
+local function open_with_custom_opener(opener, targets)
+	if opener:sub(-4) == ".app" then
+		open_with_application(opener, targets)
+	else
+		run_executable(opener, targets)
+	end
 end
 
 local function run_shell(config, targets)
@@ -247,15 +361,10 @@ local function run_shell(config, targets)
 	if not output then
 		notify("Failed to start shell: " .. tostring(err))
 	elseif not output.status.success then
-		local detail = trim(output.stderr)
-		if detail == "" then
-			detail = trim(output.stdout)
-		end
-
 		local code = output.status.code
 		local message = code and "Shell command exited with code " .. tostring(code)
 			or "Shell command was terminated"
-		notify(detail ~= "" and message .. ":\n" .. detail or message)
+		notify(output_error(output, message))
 	end
 end
 
@@ -265,25 +374,41 @@ local function handle(targets)
 		return
 	end
 
+	local config = get_config()
+	local actions = {
+		{ on = "a", desc = "Application", kind = "application" },
+		{ on = "s", desc = "Shell", kind = "shell" },
+	}
+	for _, opener in ipairs(config.custom_openers) do
+		actions[#actions + 1] = {
+			on = opener.on,
+			desc = opener.name,
+			kind = "custom",
+			opener = opener,
+		}
+	end
+
 	local choice = ya.which({
-		cands = {
-			{ on = "a", desc = "Application" },
-			{ on = "s", desc = "Shell" },
-		},
+		cands = actions,
 		silent = false,
 	})
 	if not choice then
 		return
 	end
 
-	local config = get_config()
-	if choice == 1 then
+	local action = actions[choice]
+	if action.kind == "application" then
 		local application = pick_application(config)
 		if application then
 			open_with_application(application, targets)
 		end
-	elseif choice == 2 then
+	elseif action.kind == "shell" then
 		run_shell(config, targets)
+	elseif action.kind == "custom" then
+		local opener = pick_custom_opener(config, action.opener)
+		if opener then
+			open_with_custom_opener(opener, targets)
+		end
 	end
 end
 
