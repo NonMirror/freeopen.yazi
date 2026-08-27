@@ -73,10 +73,18 @@ local function make_config(options)
 		append_unique(roots, "/System/Applications")
 	end
 
+	local shell_path = options.shell_path
+	if type(shell_path) ~= "string" or shell_path == "" then
+		shell_path = os.getenv("SHELL")
+	end
+	if not shell_path or shell_path == "" then
+		shell_path = "/bin/zsh"
+	end
+
 	return {
 		application_roots = roots,
 		fzf_args = copy_strings(options.fzf_args),
-		shell_block = options.shell_block ~= false,
+		shell_path = shell_path,
 	}
 end
 
@@ -213,12 +221,8 @@ local function open_with_application(application, targets)
 	end
 end
 
-local function escape_placeholders(value)
-	-- The shell actor expands Yazi placeholders again; %% preserves a literal percent sign.
-	local escaped = value:gsub("%%", function()
-		return "%%"
-	end)
-	return escaped
+local function trim(value)
+	return value:gsub("^%s+", ""):gsub("%s+$", "")
 end
 
 local function run_shell(config, targets)
@@ -230,15 +234,29 @@ local function run_shell(config, targets)
 		return
 	end
 
-	local parts = { escape_placeholders(command) }
+	local parts = { command }
 	for _, target in ipairs(targets) do
-		parts[#parts + 1] = escape_placeholders(ya.quote(target))
+		parts[#parts + 1] = ya.quote(target)
 	end
+	local interactive_command = table.concat(parts, " ")
+	local output, err = Command(config.shell_path)
+		:arg({ "+m", "-ic", interactive_command })
+		:cwd(tostring(fs.cwd()))
+		:output()
 
-	ya.emit("shell", {
-		table.concat(parts, " "),
-		block = config.shell_block,
-	})
+	if not output then
+		notify("Failed to start shell: " .. tostring(err))
+	elseif not output.status.success then
+		local detail = trim(output.stderr)
+		if detail == "" then
+			detail = trim(output.stdout)
+		end
+
+		local code = output.status.code
+		local message = code and "Shell command exited with code " .. tostring(code)
+			or "Shell command was terminated"
+		notify(detail ~= "" and message .. ":\n" .. detail or message)
+	end
 end
 
 local function handle(targets)
