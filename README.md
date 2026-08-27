@@ -65,7 +65,7 @@ file
 file "/path/to/target-1" "/path/to/target-2"
 ```
 
-### 自定义打开目录
+### 自定义目录
 
 `custom_openers` 中的每个条目都会在 `...` 菜单中添加一项。例如，以下配置会添加按键为 <kbd>t</kbd>、名称为 `Tools` 的选项，并使用 fzf 递归搜索 `~/Tools`：
 
